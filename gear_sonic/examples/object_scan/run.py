@@ -32,6 +32,7 @@ from gear_sonic.examples.object_scan.planning import (
     base_for_wrist,
     interpolate_pose,
     navigation_command,
+    plan_table_waypoints,
     pose_error,
     quaternion,
     rotation,
@@ -65,6 +66,9 @@ class Config:
     orientation_tolerance_degrees: float = 10
     hold_seconds: float = 0.75
     speed: float = 0.30
+    table_clearance: float = 0.55
+    waypoint_spacing: float = 0.30
+    waypoint_angle_degrees: float = 15
     view_timeout: float = 150
     startup_timeout: float = 600
     command_port: int = 5566
@@ -88,10 +92,14 @@ class Config:
             raise ValueError("Wrist heights must be at least 0.08 m above the tabletop")
         if self.wrist_radius < self.obstacle_radius + 0.30:
             raise ValueError("Wrist radius must leave >= 0.30 m outside the object/table")
-        if self.object_distance < self.obstacle_radius + 0.55:
+        if self.object_distance <= self.obstacle_radius + self.table_clearance:
             raise ValueError("Initial robot stance is too close to the object")
-        if not 0.2 <= self.speed <= 0.4 or not 0 < self.step_min_degrees <= self.step_max_degrees <= 45:
-            raise ValueError("Use slow-walk speed in [0.2, 0.4] m/s and arc steps in (0, 45] degrees")
+        if not 0.2 <= self.speed <= 0.4 or not 0 < self.step_min_degrees <= self.step_max_degrees <= 180:
+            raise ValueError("Use slow-walk speed in [0.2, 0.4] m/s and view steps in (0, 180] degrees")
+        if self.table_clearance < 0.35 or not 0.20 <= self.waypoint_spacing <= 0.50:
+            raise ValueError("Use table clearance >= 0.35 m and waypoint spacing in [0.20, 0.50] m")
+        if not 5 <= self.waypoint_angle_degrees <= 30:
+            raise ValueError("Use waypoint angles in [5, 30] degrees")
         if (
             min(
                 self.position_tolerance,
@@ -262,12 +270,22 @@ class ScanSession:
         self.last_navigation_update = -float("inf")
         self.navigation_direction = np.zeros(2)
         self.navigation_facing = np.array([1.0, 0.0, 0.0])
+        self.navigation_waypoints = None
+        self.waypoint_index = 0
+        self.retraction_gate = ArrivalGate(
+            position_tolerance=0.12,
+            orientation_tolerance=np.deg2rad(20),
+            linear_speed_tolerance=0.15,
+            angular_speed_tolerance=0.75,
+            hold_seconds=0.30,
+        )
         self.telemetry = (output / "telemetry.jsonl").open("w", buffering=1)
 
     def transition(self, phase):
         self.phase = phase
         self.phase_start = time.monotonic()
         self.gate.since = None
+        self.retraction_gate.since = None
         print(f"[{self.sim.data.time:7.2f}s] {phase}", flush=True)
 
     def next_goal(self):
@@ -284,7 +302,10 @@ class ScanSession:
             self.wrist_target = self.object_pose.compose(self.goal.wrist_in_object)
             base_world = self.object_pose.compose(Pose([*self.base_target, 0], [1, 0, 0, 0])).position[:2]
             reachable, pos_error, angle_error = self.sim.reachable(self.wrist_target, base_world, self.base_yaw)
-            if reachable and np.linalg.norm(self.base_target) > self.config.obstacle_radius + 0.40:
+            if (
+                reachable
+                and np.linalg.norm(self.base_target) > self.config.obstacle_radius + self.config.table_clearance
+            ):
                 break
             if not hasattr(self.planner, "sample_current_view"):
                 raise RuntimeError("External planner supplied an unreachable wrist pose")
@@ -293,6 +314,20 @@ class ScanSession:
             raise RuntimeError(
                 f"No reachable goal after 30 proposals; IK error {pos_error:.3f}m/{np.rad2deg(angle_error):.1f}deg"
             )
+        base_xy = self.object_pose.inverse().compose(self.sim.body_pose("pelvis")).position[:2]
+        self.navigation_waypoints = plan_table_waypoints(
+            base_xy, self.base_target, self.config.obstacle_radius, self.config.table_clearance,
+            self.config.waypoint_spacing, self.config.waypoint_angle_degrees,
+        )
+        self.waypoint_index = 0
+        write_json(self.output / f"route_{self.goal.index:03d}.json", {
+            "frame": "object",
+            "start_xy": base_xy.tolist(),
+            "waypoints_xy": self.navigation_waypoints.tolist(),
+            "keepout_radius_m": self.config.obstacle_radius + self.config.table_clearance,
+            "waypoint_spacing_m": self.config.waypoint_spacing,
+            "max_angle_degrees": self.config.waypoint_angle_degrees,
+        })
         self.goal_start = time.monotonic()
         self.last_navigation_update = -float("inf")
         self.position_correction[:] = 0
@@ -301,7 +336,8 @@ class ScanSession:
         write_json(self.output / f"goal_{self.goal.index:03d}.json", self.goal.to_dict())
         self.transition("move")
         print(
-            f"  View {self.goal.index}: object-relative wrist {self.goal.wrist_in_object.position.round(3)}",
+            f"  View {self.goal.index}: object-relative wrist {self.goal.wrist_in_object.position.round(3)}, "
+            f"{len(self.navigation_waypoints)} travel waypoints",
             flush=True,
         )
 
@@ -350,10 +386,20 @@ class ScanSession:
                 )
             nominal = [base.compose(p) for p in self.nominal_local]
             if self.phase == "move":
+                # Passing an intermediate station does not stop, extend the arm,
+                # capture, or request another goal. Only the last station does.
+                while (
+                    self.waypoint_index < len(self.navigation_waypoints) - 1
+                    and np.linalg.norm(base_xy - self.navigation_waypoints[self.waypoint_index]) < 0.09
+                ):
+                    self.waypoint_index += 1
+                    self.last_navigation_update = -float("inf")
+                navigation_target = self.navigation_waypoints[self.waypoint_index]
                 velocity = navigation_command(
-                    base_xy, self.base_target, self.config.obstacle_radius, 0.35, self.config.speed
+                    base_xy, navigation_target, self.config.obstacle_radius,
+                    self.config.table_clearance, self.config.speed,
                 )
-                distance = np.linalg.norm(base_xy - self.base_target)
+                distance = np.linalg.norm(base_xy - navigation_target)
                 yaw = rotation(base.quaternion).as_euler("ZYX")[0]
                 heading_error = abs(wrap_angle(np.arctan2(facing_world[1], facing_world[0]) - yaw))
                 if distance > 0.09:
@@ -371,7 +417,10 @@ class ScanSession:
                     facing_world = self.navigation_facing
                 else:
                     velocity[:] = 0
-                    if heading_error < np.deg2rad(12):
+                    if (
+                        self.waypoint_index == len(self.navigation_waypoints) - 1
+                        and heading_error < np.deg2rad(12)
+                    ):
                         self.transition("settle")
                 targets = three_point_targets(base, nominal)
             elif self.phase == "settle":
@@ -428,9 +477,14 @@ class ScanSession:
                     self.return_start = actual_wrist
                     self.transition("retract")
             elif self.phase == "retract":
-                nominal[1] = interpolate_pose(self.return_start, nominal[1], (now - self.phase_start) / 2)
+                carry_target = nominal[1]
+                nominal[1] = interpolate_pose(self.return_start, carry_target, (now - self.phase_start) / 2)
                 targets = three_point_targets(base, nominal)
-                if now - self.phase_start > 2.5:
+                wrist_speed, angular_speed = self.sim.body_speed("right_wrist_yaw_link")
+                if now - self.phase_start > 2.5 and self.retraction_gate.update(
+                    now, actual_wrist, carry_target, wrist_speed, angular_speed,
+                    self.sim.body_speed("pelvis")[0],
+                ):
                     self.next_goal()
             if self.goal:
                 position_error, orientation_error = pose_error(actual_wrist, self.wrist_target)
@@ -440,6 +494,9 @@ class ScanSession:
                     "phase": self.phase,
                     "base_xy_object": base_xy.tolist(),
                     "base_target_xy_object": self.base_target.tolist(),
+                    "navigation_target_xy_object": self.navigation_waypoints[self.waypoint_index].tolist(),
+                    "waypoint_index": self.waypoint_index + 1,
+                    "waypoint_count": len(self.navigation_waypoints),
                     "command_mode": mode,
                     "command_speed": speed,
                     "wrist_world": actual_wrist.to_dict(),

@@ -171,6 +171,56 @@ def base_for_wrist(goal, forward_reach=0.32, right_offset=-0.20):
     return xy, yaw
 
 
+def plan_table_waypoints(
+    start_xy, target_xy, obstacle_radius, clearance=0.55, spacing=0.30, max_angle_degrees=15,
+):
+    """Plan base positions around a circular table in the object frame.
+
+    Interpolate radius between the two safe stances while following the shortest
+    angular sweep. Equal radii give a circle; unequal radii change gradually,
+    without a separate retreat or any radius larger than the endpoints. The arc
+    direction is chosen once. Both points and their connecting chords clear the
+    inflated table; close-to-boundary endpoints need finer angular sampling.
+    These are transit waypoints, never additional wrist goals or scan requests.
+    """
+    start, target = np.asarray(start_xy, dtype=float), np.asarray(target_xy, dtype=float)
+    if start.shape != (2,) or target.shape != (2,) or not np.isfinite([start, target]).all():
+        raise ValueError("Navigation endpoints must be finite XY positions")
+    parameters = [obstacle_radius, clearance, spacing, max_angle_degrees]
+    if not np.isfinite(parameters).all() or min(parameters) <= 0 or max_angle_degrees > 45:
+        raise ValueError("Use positive route dimensions and a waypoint angle in (0, 45] degrees")
+    keepout = obstacle_radius + clearance
+    r0, r1 = np.linalg.norm(start), np.linalg.norm(target)
+    if min(r0, r1) <= keepout:
+        raise ValueError("Navigation endpoint violates table clearance")
+    a0, a1 = np.arctan2(start[1], start[0]), np.arctan2(target[1], target[0])
+    sweep = wrap_angle(a1 - a0)
+    # Bound each segment's polar arc length using the largest endpoint radius.
+    length_bound = np.hypot(r1 - r0, max(r0, r1) * sweep)
+    count = max(1, int(np.ceil(length_bound / spacing)))
+    if sweep != 0:
+        # A chord with endpoint radii >= r_min is outside r_min*cos(dtheta/2).
+        # Preserve half the available radial margin by refining the angular
+        # spacing, never by inflating the travel radius.
+        r_min = min(r0, r1)
+        angular_step = min(
+            np.deg2rad(max_angle_degrees),
+            2 * np.arccos((keepout + r_min) / (2 * r_min)),
+        )
+        if angular_step <= 0:
+            raise ValueError("Navigation endpoints are too close to the table clearance boundary")
+        count = max(count, int(np.ceil(abs(sweep) / angular_step)))
+    if count > 10000:
+        raise ValueError("Route needs too many waypoints; increase endpoint clearance or waypoint spacing")
+    fraction = np.linspace(0, 1, count + 1)[1:]
+    radii = (1 - fraction) * r0 + fraction * r1
+    angles = a0 + fraction * sweep
+    points = radii[:, None] * np.column_stack([np.cos(angles), np.sin(angles)])
+    # Preserve the caller's exact final station, including at the +/-pi seam.
+    points[-1] = target.copy()
+    return points
+
+
 def navigation_command(base_xy, target_xy, object_radius, clearance, speed_limit=0.30):
     """Follow an arc outside a cylindrical keep-out region, with radial feedback.
 

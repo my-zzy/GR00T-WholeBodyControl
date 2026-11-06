@@ -53,15 +53,16 @@ What happens
 3. Choose a base stance behind/left of that right-wrist target. Check arm
    reachability with joint-limited IK on separate scratch MuJoCo data.
    IK NEVER sets the real simulation's joint positions or motor commands.
-4. Walk toward the stance while facing the object. Arc/radial feedback avoids
-   cutting through the table/object footprint. All motor commands come from SONIC.
+4. Plan intermediate base waypoints around the inflated table/object footprint,
+   then walk through them while facing the object with the arm retracted.
+   Only the final station starts wrist positioning. All motor commands come from SONIC.
 5. Stand, smoothly move the right wrist to the goal, and apply bounded pose
    bias correction. Head and left wrist keep comfortable body-relative targets.
 6. Require the MEASURED wrist position, orientation, wrist speed, and base
    speed to satisfy the arrival gate continuously before capturing.
 7. Raycast from the ACTUAL scanner pose into MuJoCo geometry, saving a point
    cloud and metadata. Only then ask the view planner for its next goal.
-8. Retract the arm, move to the next view, and repeat.
+8. Retract the arm, check measured retraction, then request the next view and repeat.
 
 The base/wrist feedback comes from actual MuJoCo kinematics. The controller
 does not use the upstream base_trans_measured visualization placeholder.
@@ -78,13 +79,16 @@ Defaults and useful options
                                   Right-wrist heights, metres above ground
   --wrist-radius 0.95             Approximate wrist distance from object centre
   --step-min-degrees 8 --step-max-degrees 16
-                                  Random angular increment after each scan
+                                  Random angular increment after each scan (up to 180)
   --object-radius 0.18 --object-height 0.30
                                   Cylinder dimensions in metres
   --table-radius 0.45 --table-height 0.72
                                   Round table radius and tabletop height
   --scanner-mass 0.15             Simulated wrist payload, kilograms
   --speed 0.30                    Commanded slow-walk speed, m/s ([0.2, 0.4])
+  --table-clearance 0.55          Minimum pelvis XY distance outside table/object edge
+  --waypoint-spacing 0.30        Maximum distance between travel waypoints, metres
+  --waypoint-angle-degrees 15    Maximum angular step between travel waypoints
   --position-tolerance 0.05       Measured wrist error limit, metres
   --orientation-tolerance-degrees 10
                                   Measured wrist rotation error limit
@@ -97,6 +101,48 @@ guarantee for SONIC or for a physical scanner. Tightening them can correctly
 produce a timeout. A kinematically reachable target does not guarantee the
 learned policy will track it within a particular tolerance.
 
+Moving to a far-side target
+--------------------------
+
+Every accepted wrist goal is converted to a final base stance. Long moves are
+subdivided along the shorter angular sweep around the table. Radius changes
+gradually from the current standing radius to the final standing radius:
+
+  r(t) = (1 - t) * current_radius + t * final_radius
+  angle(t) = current_angle + t * shortest_angular_change
+
+Equal endpoint radii give a circular arc. There is no added outward retreat or
+travel radius larger than either endpoint. A farther destination still requires
+gradual outward movement while circling. The direction is fixed when the route
+is planned, including for opposite-side targets. The keep-out radius remains
+max(table_radius, object_radius) + --table-clearance. If the endpoints are close
+to that boundary, angular sampling becomes finer so the connecting chords also
+clear it; the planner does not move the route farther out.
+
+The default segments are at most 0.30 m long and 15 degrees apart; a nearby
+target can need only one waypoint. The robot advances through intermediate
+waypoints within 0.09 m without scanning or stopping at each one. It keeps a
+body-relative carrying pose while moving and extends the wrist only after
+settling at the final station. After a capture, measured retraction must remain
+within 0.12 m / 20 degrees of the carrying pose, with low base/wrist speed, for
+0.30 s before the next goal is requested. The original scan arrival tolerances
+and wrist correction remain unchanged.
+
+For a demonstration with the second target almost behind the table:
+
+  python -m gear_sonic.examples.object_scan.run --views 2 --step-min-degrees 170 --step-max-degrees 170
+
+Your external planner does not need to produce the intermediate points: it still
+returns one final ScanGoal per completed scan. The task controller inserts only
+base travel waypoints and leaves the requested wrist pose unchanged. Initial or
+final base positions inside the keep-out region are rejected. A measured base
+entry into that region aborts the move.
+
+This is circular-table geometric routing, not full-body collision-free motion
+planning. Tracking error, arbitrary obstacles, scanner geometry and real-world
+localization still need separate validation. Simulator contact/fall checks remain
+active; the scanner housing itself has collision disabled as described below.
+
 Artifacts
 ---------
 
@@ -107,10 +153,14 @@ By default each run is stored in .cache/object_scan/<timestamp>/:
   controller.log         Native SONIC initialization/inference output
   telemetry.jsonl        Measured base/wrist states and pose errors at 50 Hz
   goal_001.json          The accepted target, in the object frame
+  route_001.json         Base waypoints and keep-out radius, in the object frame
   scan_001.npz           Actual depth, world/object point clouds, physics state
   scan_001.ply           Object-frame point cloud, readable by common viewers
   scan_001.json          Target, actual poses, errors, and capture metadata
   summary.json           complete/failed/interrupted and all accepted scans
+
+Telemetry also includes the current navigation target and 1-based waypoint
+index/count, so a recorded path can be compared with the planned route.
 
 The virtual scanner uses a 48 x 36 ray grid with a 48-degree horizontal field
 of view. Only first intersections on the object's surface are saved; robot
@@ -182,6 +232,7 @@ Tests
   python -m unittest gear_sonic.examples.object_scan.test_object_scan -v
 
 The tests cover object/root transforms and wrist tracker offsets, shortest-path
-rotation interpolation, arc navigation/clearance, sequential goal generation,
-the measured arrival gate, input validation, and actual MuJoCo ray intersections.
+rotation interpolation, opposite-side waypoint/chord clearance, waypoint
+sequencing without intermediate scans, measured arm retraction, sequential goal
+generation, the measured arrival gate, input validation, and actual MuJoCo ray intersections.
 The headless command above additionally exercises the pretrained controller.
